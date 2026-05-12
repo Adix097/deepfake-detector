@@ -29,3 +29,6 @@ Thumbs.db
 # FFmpeg / temporary files
 *.tmp
 *.swp
+
+# Important info
+notes.md
