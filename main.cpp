@@ -15,6 +15,7 @@ extern "C" {
 #include <cmath>
 
 using namespace std;
+const int TARGET_SAMPLE_RATE {16000};
 
 // helper function just to print any errors
 int printError(const char* prefix, int errorCode) {
@@ -69,15 +70,50 @@ void printStreamInformation(const AVCodec* codec, const AVCodecContext* codec_ct
     cout << "Float Output:  " << ((av_sample_fmt_is_planar(codec_ctx->sample_fmt)) ? "yes" : "no") << endl;
 }
 
+void processFrame (AVFrame* f, SwrContext* swr_ctx, AVCodecContext* codec_ctx, vector<float>& samples) {
+    int64_t out_count = av_rescale_rnd(
+        swr_get_delay(swr_ctx, codec_ctx->sample_rate) + f->nb_samples,
+        TARGET_SAMPLE_RATE,
+        codec_ctx->sample_rate,
+        AV_ROUND_UP
+    );
+    vector<float> buff(out_count);
+    uint8_t* out_data = reinterpret_cast<uint8_t*>(buff.data());
+    int converted = swr_convert (
+        swr_ctx,
+        &out_data,
+        out_count,
+        (const uint8_t**)f->extended_data,
+        f->nb_samples
+    );
+    if (converted > 0) {
+        buff.resize(converted);
+        samples.insert(samples.end(), buff.begin(), buff.end());
+    }
+}
+
+int receiveAndProcess(AVFrame* f, SwrContext* swr_ctx, AVCodecContext* codec_ctx, vector<float>& samples) {
+    int err {0};
+    while ((err = avcodec_receive_frame(codec_ctx, f)) == 0) {
+        processFrame(f, swr_ctx, codec_ctx, samples);
+        av_frame_unref(f);
+    }
+    return err;
+};
+
 int main() {
     const char* filename = "./input.mp3";
-    const int TARGET_SAMPLE_RATE {16000};
     int err {0};
 
     // Open file and find stream
     AVFormatContext* format_ctx {nullptr};
     if ((err = avformat_open_input(&format_ctx, filename, nullptr, 0)) != 0) {
         return printError("Error opening file!", err);
+    }
+
+    if ((err = avformat_find_stream_info(format_ctx, nullptr)) < 0) {
+        avformat_close_input(&format_ctx);
+        return printError("Failed to find stream info.", err);
     }
 
     // find the audio stream of the input file
@@ -153,40 +189,6 @@ int main() {
     AVFrame* frame = av_frame_alloc();
     AVPacket* packet = av_packet_alloc();
 
-    auto processFrame = [&](AVFrame* f) {
-        int64_t out_count = av_rescale_rnd(
-            swr_get_delay(swr_ctx, codec_ctx->sample_rate) + f->nb_samples,
-            TARGET_SAMPLE_RATE,
-            codec_ctx->sample_rate,
-            AV_ROUND_UP
-        );
-
-        vector<float> buff(out_count);
-        uint8_t* out_data = reinterpret_cast<uint8_t*>(buff.data());
-
-        int converted = swr_convert (
-            swr_ctx,
-            &out_data,
-            out_count,
-            (const uint8_t**)f->extended_data,
-            f->nb_samples
-        );
-
-        if (converted > 0) {
-            buff.resize(converted);
-            samples.insert(samples.end(), buff.begin(), buff.end());
-        }
-    };
-
-    auto receiveAndProcess = [&]() -> int {
-        int e = 0;
-        while ((e = avcodec_receive_frame(codec_ctx, frame)) == 0) {
-            processFrame(frame);
-            av_frame_unref(frame);
-        }
-        return e;
-    };
-
     // read the file
     while ((err = av_read_frame(format_ctx, packet)) != AVERROR_EOF) {
         
@@ -210,14 +212,14 @@ int main() {
         }
 
         // sometimes while receiving frames error code AVERROR(EAGAIN) hits, which simply means "all buffers are full, receive some frames and try again" so it is not an actual error.
-        if ((err = receiveAndProcess()) != AVERROR(EAGAIN)) {
+        if ((err = receiveAndProcess(frame, swr_ctx, codec_ctx, samples)) != AVERROR(EAGAIN)) {
             printError("Something went wrong while receiving decoded frames!", err);
             break;
         }
     }
 
     avcodec_send_packet(codec_ctx, nullptr);
-    receiveAndProcess();
+    receiveAndProcess(frame, swr_ctx, codec_ctx, samples);
 
     int64_t remaining = swr_get_delay(swr_ctx, codec_ctx->sample_rate);
     if (remaining > 0) {
@@ -246,6 +248,5 @@ int main() {
     swr_free(&swr_ctx);
     avcodec_free_context(&codec_ctx);
     avformat_close_input(&format_ctx);
-
     return 0;
 }
