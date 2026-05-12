@@ -4,15 +4,17 @@ extern "C" {
     #include <libavutil/frame.h>
     #include <libavutil/error.h>
     #include <libavutil/samplefmt.h>
+    #include <libavutil/channel_layout.h>
+    #include <libswresample/swresample.h>
 }
 
 #include <iostream>
 #include <vector>
 #include <fstream>
 #include <cstring>
+#include <cmath>
 
 using namespace std;
-const bool RAW_OUT_ON_PLANAR = false;
 
 // helper function just to print any errors
 int printError(const char* prefix, int errorCode) {
@@ -64,73 +66,15 @@ void printStreamInformation(const AVCodec* codec, const AVCodecContext* codec_ct
     cout << "Sample Rate:   " << codec_ctx->sample_rate << endl;
     cout << "Sample Size:   " << av_get_bytes_per_sample(codec_ctx->sample_fmt) << endl;
     cout << "Channels:      " << codec_ctx->ch_layout.nb_channels << endl;
-    cout << "Float Output:  " << ((!RAW_OUT_ON_PLANAR || av_sample_fmt_is_planar(codec_ctx->sample_fmt)) ? "yes" : "no") << endl;
-}
-
-// IDK this function i copied it from somewhere
-float getSample(const AVCodecContext* codecCtx, uint8_t* buffer, int index) {
-    switch (av_get_packed_sample_fmt(codecCtx->sample_fmt)) {
-        case AV_SAMPLE_FMT_FLT:
-            return reinterpret_cast<float*>(buffer)[index];
-        case AV_SAMPLE_FMT_DBL:
-            return (float)reinterpret_cast<double*>(buffer)[index];
-        case AV_SAMPLE_FMT_S16:
-            return reinterpret_cast<int16_t*>(buffer)[index] / 32768.0f;
-        case AV_SAMPLE_FMT_S32:
-            return reinterpret_cast<int32_t*>(buffer)[index] / 2147483648.0f;
-        default:
-            return 0.0f;
-    }
-}
-
-void handleFrame(const AVCodecContext* codecCtx, const AVFrame* frame, ofstream& outFile) {
-    if(av_sample_fmt_is_planar(codecCtx->sample_fmt) == 1) {
-        // This means that the data of each channel is in its own buffer.
-        // => frame->extended_data[i] contains data for the i-th channel.
-        for(int s = 0; s < frame->nb_samples; ++s) {
-            for(int c = 0; c < codecCtx->ch_layout.nb_channels; ++c) {
-                float sample = getSample(codecCtx, frame->extended_data[c], s);
-                outFile.write(reinterpret_cast<const char*>(&sample), sizeof(float));
-            }
-        }
-    } else {
-        // This means that the data of each channel is in the same buffer.
-        // => frame->extended_data[0] contains data of all channels.
-        if(RAW_OUT_ON_PLANAR) {
-            outFile.write(reinterpret_cast<const char*>(frame->extended_data[0]), frame->linesize[0]);
-        } else {
-            for(int s = 0; s < frame->nb_samples; ++s) {
-                for(int c = 0; c < codecCtx->ch_layout.nb_channels; ++c) {
-                    float sample = getSample(codecCtx, frame->extended_data[0], s*codecCtx->ch_layout.nb_channels+c);
-                    outFile.write(reinterpret_cast<const char*>(&sample), sizeof(float));
-                }
-            }
-        }
-    }
-}
-
-int receiveAndHandle(AVCodecContext* codec_ctx, AVFrame* frame, ofstream& outFile) {
-    int err = 0;
-    // Read the packets from the decoder.
-    // Each packet may generate more than one frame, depending on the codec
-    while((err = avcodec_receive_frame(codec_ctx, frame)) == 0) {
-        handleFrame(codec_ctx, frame, outFile);
-        av_frame_unref(frame);
-    }
-    return err;
+    cout << "Float Output:  " << ((av_sample_fmt_is_planar(codec_ctx->sample_fmt)) ? "yes" : "no") << endl;
 }
 
 int main() {
     const char* filename = "./input.mp3";
-
-    // making a file to write the output into
-    ofstream outFile("output.raw", ios::binary);
-    if (!outFile.is_open()) {
-        cout << "Failed to create output file!\n";
-        return -1;
-    }
-
+    const int TARGET_SAMPLE_RATE {16000};
     int err {0};
+
+    // Open file and find stream
     AVFormatContext* format_ctx {nullptr};
     if ((err = avformat_open_input(&format_ctx, filename, nullptr, 0)) != 0) {
         return printError("Error opening file!", err);
@@ -173,17 +117,75 @@ int main() {
         return printError("Failed to open codec.", err);
     }
 
-    // when decoding the decorder will give us an AVFrame containing the decoded data if we give him an AVPacket. The AVPAcket will be given to us by out AVFormatContext.
-    AVFrame* frame {nullptr};
+    // setup resampler,
+    // Input: whatever the decoder gives
+    // Output: 16Khz, mono, float32
 
-    if (!(frame = av_frame_alloc())) {
-        avcodec_free_context(&codec_ctx);
-        avformat_close_input(&format_ctx);
-        return -1;
+    SwrContext* swr_ctx {nullptr};
+    AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_MONO;
+    AVChannelLayout in_ch_layout = codec_ctx->ch_layout;
+
+    if ((err = swr_alloc_set_opts2(
+        &swr_ctx,
+        &out_ch_layout,
+        AV_SAMPLE_FMT_FLT,
+        TARGET_SAMPLE_RATE,
+        &in_ch_layout,
+        codec_ctx->sample_fmt,
+        codec_ctx->sample_rate,
+        0, nullptr)) < 0) {
+            avcodec_free_context(&codec_ctx);
+            avformat_close_input(&format_ctx);
+            return printError("Failed to setup resampler.", err);
     }
 
-    // prepare the packet
+    if ((err = swr_init(swr_ctx)) < 0) {
+        swr_free(&swr_ctx);
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&format_ctx);
+        return printError("Failed to initialize resampler.", err);
+    }
+
+    // decode & resample into memory
+    // when decoding the decorder will give us an AVFrame containing the decoded data if we give him an AVPacket. The AVPAcket will be given to us by out AVFormatContext.
+    
+    vector<float> samples;
+    AVFrame* frame = av_frame_alloc();
     AVPacket* packet = av_packet_alloc();
+
+    auto processFrame = [&](AVFrame* f) {
+        int64_t out_count = av_rescale_rnd(
+            swr_get_delay(swr_ctx, codec_ctx->sample_rate) + f->nb_samples,
+            TARGET_SAMPLE_RATE,
+            codec_ctx->sample_rate,
+            AV_ROUND_UP
+        );
+
+        vector<float> buff(out_count);
+        uint8_t* out_data = reinterpret_cast<uint8_t*>(buff.data());
+
+        int converted = swr_convert (
+            swr_ctx,
+            &out_data,
+            out_count,
+            (const uint8_t**)f->extended_data,
+            f->nb_samples
+        );
+
+        if (converted > 0) {
+            buff.resize(converted);
+            samples.insert(samples.end(), buff.begin(), buff.end());
+        }
+    };
+
+    auto receiveAndProcess = [&]() -> int {
+        int e = 0;
+        while ((e = avcodec_receive_frame(codec_ctx, frame)) == 0) {
+            processFrame(frame);
+            av_frame_unref(frame);
+        }
+        return e;
+    };
 
     // read the file
     while ((err = av_read_frame(format_ctx, packet)) != AVERROR_EOF) {
@@ -208,18 +210,40 @@ int main() {
         }
 
         // sometimes while receiving frames error code AVERROR(EAGAIN) hits, which simply means "all buffers are full, receive some frames and try again" so it is not an actual error.
-        if ((err = receiveAndHandle(codec_ctx, frame, outFile)) != AVERROR(EAGAIN)) {
+        if ((err = receiveAndProcess()) != AVERROR(EAGAIN)) {
             printError("Something went wrong while receiving decoded frames!", err);
             break;
         }
     }
 
     avcodec_send_packet(codec_ctx, nullptr);
-    receiveAndHandle(codec_ctx, frame, outFile);
+    receiveAndProcess();
+
+    int64_t remaining = swr_get_delay(swr_ctx, codec_ctx->sample_rate);
+    if (remaining > 0) {
+        vector<float> buff(remaining);
+        uint8_t* out_data = reinterpret_cast<uint8_t*>(buff.data());
+        int converted = swr_convert(swr_ctx, &out_data, remaining, nullptr, 0);
+        if (converted > 0) {
+            buff.resize(converted);
+            samples.insert(samples.end(), buff.begin(), buff.end());
+        }
+    }
+
+    // Normalize
+    float peak = 0.0f;
+    for (auto s : samples) peak = max(peak, abs(s));
+    cout << "Peak amplitude: " << peak << endl;
+
+    if (peak > 0.0f) {
+        auto scale = 1.0f / peak;
+        for (auto& s : samples) s *= scale;
+    }
 
     // at last clean up everything we opened.
     av_frame_free(&frame);
     av_packet_free(&packet);
+    swr_free(&swr_ctx);
     avcodec_free_context(&codec_ctx);
     avformat_close_input(&format_ctx);
 
