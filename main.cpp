@@ -13,9 +13,15 @@ extern "C" {
 #include <fstream>
 #include <cstring>
 #include <cmath>
+#include <fftw3.h>
+#include <complex>
 
 using namespace std;
 const int TARGET_SAMPLE_RATE {16000};
+
+struct SpectrogramFrame {
+    vector<float> magnitudes;
+};
 
 // helper function just to print any errors
 int printError(const char* prefix, int errorCode) {
@@ -100,6 +106,46 @@ int receiveAndProcess(AVFrame* f, SwrContext* swr_ctx, AVCodecContext* codec_ctx
     }
     return err;
 };
+
+vector<SpectrogramFrame> computeSTFT (const vector<float>& samples, int sample_rates, int window_ms = 25, int hop_ms = 10) {
+    int window_size = sample_rates * window_ms / 1000;
+    int hop_size = sample_rates * hop_ms / 1000;
+    int fft_bins = window_size / 2 + 1;
+
+    vector<float> hann(window_size);
+    for (int i = 0; i < window_size; ++i) hann[i] = 0.5f * (1.0f - cos(2.0f * M_PI * i / (window_size - 1)));
+
+    // FFTW setup
+    vector<double> in(window_size);
+    vector<fftw_complex> out(fft_bins);
+
+    fftw_plan plan = fftw_plan_dft_r2c_1d(window_size, in.data(), out.data(), FFTW_ESTIMATE);
+
+    vector<SpectrogramFrame> spectrogram;
+
+    for (int start = 0; start + window_size <= (int)samples.size(); start += hop_size) {
+        // Apply han window
+        for (int i = 0; i < window_size; ++i) {
+            in[i] = samples[start + i] * hann[i];
+        }
+
+        fftw_execute(plan);
+
+        struct SpectrogramFrame frame;
+        frame.magnitudes.resize(fft_bins);
+
+        for (int i = 0; i < fft_bins; ++i) {
+            float re = out[i][0];
+            float im = out[i][1];
+            frame.magnitudes[i] = sqrt(re*re + im*im);
+        }
+
+        spectrogram.push_back(frame);
+    }
+
+    fftw_destroy_plan(plan);
+    return spectrogram;
+}
 
 int main() {
     const char* filename = "./input.mp3";
@@ -241,6 +287,19 @@ int main() {
         auto scale = 1.0f / peak;
         for (auto& s : samples) s *= scale;
     }
+
+    ofstream specFile("spectrogram.csv");
+    auto spectrogram = computeSTFT(samples, TARGET_SAMPLE_RATE);
+
+    for (size_t t = 0; t < spectrogram.size(); t++) {
+        for (size_t f = 0; f < spectrogram[t].magnitudes.size(); f++) {
+            specFile << spectrogram[t].magnitudes[f];
+            if (f + 1 < spectrogram[t].magnitudes.size()) specFile << ",";
+        }
+        specFile << "\n";
+    }
+
+    specFile.close();
 
     // at last clean up everything we opened.
     av_frame_free(&frame);
