@@ -1,0 +1,31 @@
+# Build output
+app.out
+*.out
+*.o
+build/
+cmake-build/
+
+# Output data (generated)
+output/
+*.csv
+*.raw
+*.wav
+*.log
+
+# Input audio (don’t commit datasets unless intentional)
+input/
+*.mp3
+*.flac
+*.wav
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# FFmpeg / temporary files
+*.tmp
+*.swp
